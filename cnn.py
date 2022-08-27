@@ -1,85 +1,168 @@
-import os
-import tensorflow as tf
 import numpy as np
-from tensorflow.keras.datasets import mnist
-from sklearn.decomposition import TruncatedSVD
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import NearestNeighbors
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import copy
-from tensorflow.keras.models import load_model
-
-SEED = 1000
-WIDTH = 28
-HEIGHT = 28
+import tensorflow as tf
+import os
+from tensorflow.keras.layers import Input, Dense, BatchNormalization, Activation, Flatten, Dropout
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.metrics import AUC
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.datasets import cifar10
+from tensorflow.keras.callbacks import EarlyStopping, TensorBoard
+import time
+from tensorflow.keras.applications.inception_v3 import InceptionV3
+from tensorflow.keras.layers.experimental.preprocessing import Resizing
+from tensorflow.keras.utils import plot_model
+import cv2
+from scikeras.wrappers import KerasClassifier
+from skopt.space import Integer, Real
+from skopt import BayesSearchCV
 
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-(X_train, y_train), (X_test, y_test) = mnist.load_data()
+SEED = 1000
+SHAPE_IMG = (32, 32, 3)
+CONV_SHAPE = (-1, 2, 2, 1)
+LABELS = 10
+
+WIDTH_V3 = 128
+HEIGHT_V3 = 128
+
+np.random.seed(SEED)
+
+N1 = Integer(124, 512)
+N2 = Integer(124, 256)
+DROP = Real(0.1, 0.5)
+LR = Real(0.01, 0.1)
+BATCH = 32
+EPOCHS = 30
+
+def create_premodel(n1=N1, n2=N2, epochs=EPOCHS, batch_size=BATCH, lr=LR, drop=DROP, paramsearch=True):
+    ln = 'mixed10'
+
+    v3 = InceptionV3(include_top=False, weights='imagenet', input_shape=(HEIGHT_V3, WIDTH_V3, 3))
+    for layer in v3.layers:
+        layer.treinable=False
+
+    lconv = v3.get_layer(ln)
+
+    CAMv3 = Model(v3.input, lconv.output)
+
+    input4img = Input(shape=SHAPE_IMG)
+    upimg = Resizing(HEIGHT_V3, WIDTH_V3)(input4img)
+    v3img = CAMv3(upimg)
+
+    v3mask = v3(upimg)
+    fc = Flatten()(v3mask)
+    d1 = Dense(n1, kernel_regularizer='l1')(fc)
+    bn = BatchNormalization()(d1)
+    act1 = Activation('relu')(bn)
+    d2 = Dense(n2, kernel_regularizer='l1')(fc)
+    bn2 = BatchNormalization()(d2)
+    act1 = Activation('relu')(bn2)
+    drop = Dropout(drop)(act1)
+    out = Dense(10, activation='softmax')(drop)
+
+    CAMnet = Model(input4img, v3img)
+    trainNet = Model(input4img, out)
+
+    trainNet.compile(optimizer=Adam(learning_rate=lr),
+                    loss='categorical_crossentropy',
+                    metrics=AUC())
+    trainNet.summary()
+    plot_model(trainNet, to_file="model.png", show_shapes=True)
+
+    if paramsearch:
+        return trainNet
+
+    return CAMnet, trainNet
 
 
-# test quality of data
-assert np.isnan(X_train).sum() == 0
-assert np.isnan(y_train).sum() == 0
-print(f"X: {X_train.shape}, y: {y_train.shape}")
+def train(X_train, y_train, X_test, y_test):
 
-# scale
-X_train = X_train/255
-
-# check outliers
-
-def rm_outliers_LOF(img):
-    pass
-
-def rm_outliers_auto(img):
-    img = img.reshape(1, 28, 28, 1)
-    model = load_model('./model')
-    img_out = model.predict(img)
-    img_out = img_out.reshape(28, 28)
-    return img_out
+    wrapper = KerasClassifier(model = create_premodel,
+                            drop=DROP,
+                            n1=N2,
+                            n2=N2,
+                            lr=LR)
 
 
+    bsc = BayesSearchCV(
+        wrapper,
+        {
+            'n1': N1,
+            'n2': N2,
+            'drop': DROP,
+            'lr': LR,
+        },
+        n_iter=32,
+        random_state=SEED,
+        cv=3,
+        verbose=1,
+        n_jobs=1
+        )
 
-def rm_outliers_Iforest(img, threshold=0.9):
-    assert type(threshold) == float
+    with tf.device('/gpu:0'):
+        results = bsc.fit(X_train, y_train)
 
-    img_outliers = copy.deepcopy(img).reshape(-1,1)
-    iforests = IsolationForest(n_estimators=10, random_state=SEED)
-    iforests.fit(img_outliers)
-    scores = -1*iforests.score_samples(img_outliers)
-    scores = scores.reshape(WIDTH, HEIGHT)
-    img_outliers = img_outliers.reshape(WIDTH, HEIGHT)
-    img_rm_outliers = np.where(scores > threshold, 0, img_outliers)
+    print('n1 : ' + str(results.best_params_['n1']))
+    print('n2 : ' + str(results.best_params_['n2']))
+    print('dropout : ' + str(results.best_params_['drop']))
+    print('lr : ' + str(results.best_params_['lr']))
 
-    return scores, img_rm_outliers
+    cam, good_model = create_premodel(results.best_params_['n1'],
+                                 results.best_params_['n2'],
+                                 results.best_params_['lr'],
+                                 results.best_params_['drop'],
+                                 paramsearch=False)
 
-def diagnostic_plot(img1, img3, sc=None, i=0):
-    if sc:
-        fig, ax = plt.subplots(1, 3, figsize=(16,7))
+    early_stop = EarlyStopping(monitor='val_auc', patience=10)
+    board = TensorBoard(log_dir=f'./logs/{time.time()}')
+    checkpoints = ModelCheckpoint(filepath='./model/checkpoints',
+                                  save_weights_only=True,
+                                  monitor='val_auc',
+                                  mode='max',
+                                  save_best_only=True)
 
-        ax[0].imshow(img1)
-        ax[0].set_title("Image with outliers")
+    with tf.device('/gpu:0'):
+        good_model.fit(X_train, y_train,
+                epochs=EPOCHS,
+                validation_split=0.3,
+                verbose=1,
+                callbacks=[early_stop, board, checkpoints],
+                shuffle=True,
+                batch_size=BATCH)
 
-        omi = ax[1].imshow(sc, cmap='RdBu')
-        ax[1].set_title("Isolation Forest score")
-        fig.colorbar(omi, ax=ax[1], label="Outliers")
-
-        ax[2].imshow(img3)
-        ax[2].set_title("Image without outliers")
-    else:
-        fig, ax = plt.subplots(1, 2, figsize=(16,7))
-        ax[0].imshow(img1)
-        ax[0].set_title("Image with outliers")
-        ax[1].imshow(img3)
-        ax[1].set_title("Image without outliers")
-
-    plt.savefig(f'./iforest/Iforest{i}.jpg')
-    plt.close()
-
-img1 = rm_outliers_auto(X_train[0])
-diagnostic_plot(X_train[0], img1)
+    score = model.evaluate(X_test, y_test)
+    print(f'score: {score}')
+    good_model.save('./model/model')
+    cam.save('./model/cam')
+    return model, cam
 
 
+def scoreCAM(img, CAMnet, trainNet, target):
+    convs = CAMnet.predict(img[np.newaxis, :]).reshape(CONV_SHAPE)
+    upconvs = []
+    for c in convs:
+        upc = cv2.resize(
+            c, dsize=(SHAPE_IMG[0], SHAPE_IMG[1]), interpolation=cv2.INTER_AREA)
+        upconvs.append(np.stack([upc, upc, upc], axis=-1))
+    upconvs = np.array((upconvs))
 
+    actmaps = np.multiply(upconvs, img)
+    weights = []
+    factmaps = []
 
+    for m in actmaps:
+        pred = trainNet.predict(m[np.newaxis, :])
+        w = pred[:, np.argmax(target)][0]
+        s = np.multiply(w, m)
+        factmaps.append(s)
+
+    print(np.array(factmaps).shape)
+
+    camScore = np.sum(factmaps, axis=0)
+    print(camScore.shape)
+    for x in range(SHAPE_IMG[0]):
+        for y in range(SHAPE_IMG[1]):
+            camScore[x, y] = np.max(camScore[x, y], 0)
+    return camScore
